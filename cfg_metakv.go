@@ -17,6 +17,7 @@ import (
 	"math"
 	"sync"
     "strings"
+	"encoding/json"
 )
 
 const (
@@ -62,12 +63,13 @@ func (c *CfgMetaKv) Get(key string, cas uint64) (
 	c.m.Lock()
 	defer c.m.Unlock()
     if key == CfgNodeDefsKey(NODE_DEFS_WANTED) {
-        rv := &NodeDefs{NodeDefs:make(map[string]*NodeDef}
-        tmp := &NodeDefs{NodeDefs:make(map[string]*NodeDef}
+        rv := &NodeDefs{NodeDefs:make(map[string]*NodeDef)}
+        tmp := &NodeDefs{NodeDefs:make(map[string]*NodeDef)}
         m := c.cfgMem.GetKeyWithPrefix(key)
-        for k,v := range m {
+        for _,v := range m {
             json.Unmarshal(v, tmp)
             for k1,v1 := range tmp.NodeDefs {
+				log.Printf("combining key %v", k1)	
                 rv.NodeDefs[k1] = v1
             }
             rv.UUID = tmp.UUID
@@ -81,6 +83,7 @@ func (c *CfgMetaKv) Get(key string, cas uint64) (
 
 func (c *CfgMetaKv) SetKey(key string, val []byte) (
     uint64, error) {
+	var cas uint64
     rev, err := c.cfgMem.GetRev(key, 0)
         if err != nil {
             return 0, err
@@ -96,13 +99,14 @@ func (c *CfgMetaKv) SetKey(key string, val []byte) (
                 return 0, err
             }
     }
+	return cas,err
 }
 
 func (c *CfgMetaKv) Set(key string, val []byte, cas uint64) (
 	uint64, error) {
+	log.Printf("setting key %v", key)
 	c.m.Lock()
 	defer c.m.Unlock()
-    var cas uint64
     var err error
     if key == CfgNodeDefsKey(NODE_DEFS_WANTED) {
         // split the keys
@@ -111,7 +115,7 @@ func (c *CfgMetaKv) Set(key string, val []byte, cas uint64) (
         if err != nil {
             return 0, err
         }
-        k,v := range nd.NodeDefs {
+        for k,v := range nd.NodeDefs {
             n := &NodeDefs{
                 UUID : nd.UUID,
                 NodeDefs:make(map[string]*NodeDef),
@@ -120,6 +124,7 @@ func (c *CfgMetaKv) Set(key string, val []byte, cas uint64) (
             n.NodeDefs[k] = v
             k = key + "_" + k
             val,_ = json.Marshal(n)
+			log.Printf("splitted key %v", k)	
             cas, err = c.SetKey(k, val)
         }
     } else {
@@ -136,6 +141,7 @@ func (c *CfgMetaKv) Del(key string, cas uint64) error {
 
 func (c *CfgMetaKv) delUnlocked(key string, cas uint64) error {
     keys := []string{}
+	var err error
     if strings.HasPrefix(key, CfgNodeDefsKey(NODE_DEFS_WANTED)) {
         m := c.cfgMem.GetKeyWithPrefix(CfgNodeDefsKey(NODE_DEFS_WANTED))
         for k,_ := range m {
