@@ -14,6 +14,7 @@ package cbgt
 import (
 	"fmt"
 	"sync"
+    "strings"
 )
 
 // CfgMem is a local-only, memory-only implementation of Cfg
@@ -170,4 +171,17 @@ func (c *CfgMem) Refresh() error {
 	}
 
 	return nil
+}
+
+func (c *CfgMem) GetKeyWithPrefix(prefix string) {
+	c.m.Lock()
+	defer c.m.Unlock()
+
+    rv := make(map[string][]byte)
+    for k,v := range c.Entries {
+        if strings.HasPrefix(k, prefix) {
+            rv[k] = v
+        }
+    }
+    return rv
 }
