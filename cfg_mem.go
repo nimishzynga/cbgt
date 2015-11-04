@@ -13,6 +13,7 @@ package cbgt
 
 import (
 	"fmt"
+	"strings"
 	"sync"
 )
 
@@ -170,4 +171,17 @@ func (c *CfgMem) Refresh() error {
 	}
 
 	return nil
+}
+
+func (c *CfgMem) GetKeyWithPrefix(prefix string) map[string][]byte {
+	c.m.Lock()
+	defer c.m.Unlock()
+
+	rv := make(map[string][]byte)
+	for k, v := range c.Entries {
+		if strings.HasPrefix(k, prefix) {
+			rv[k] = v.Val
+		}
+	}
+	return rv
 }

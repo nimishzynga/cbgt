@@ -12,9 +12,11 @@
 package cbgt
 
 import (
+	"encoding/json"
 	"github.com/couchbase/cbauth/metakv"
 	log "github.com/couchbase/clog"
 	"math"
+	"strings"
 	"sync"
 )
 
@@ -24,11 +26,13 @@ const (
 )
 
 type CfgMetaKv struct {
-	m        sync.Mutex
-	path     string
-	cancelCh chan struct{}
-	rev      interface{}
-	cfgMem   *CfgMem
+	uuid        string
+	m           sync.Mutex
+	path        string
+	cancelCh    chan struct{}
+	rev         interface{}
+	nodeDefKeys map[string]int
+	cfgMem      *CfgMem
 }
 
 // NewCfgMetaKv returns a CfgMetaKv that reads and stores its single
@@ -38,6 +42,7 @@ func NewCfgMetaKv() (*CfgMetaKv, error) {
 		path:     BASE_CFG_PATH,
 		cancelCh: make(chan struct{}),
 		cfgMem:   NewCfgMem(),
+		uuid:     NewUUID(),
 	}
 	go func() {
 		for {
@@ -57,14 +62,29 @@ func (c *CfgMetaKv) Get(key string, cas uint64) (
 	[]byte, uint64, error) {
 	c.m.Lock()
 	defer c.m.Unlock()
+	if key == CfgNodeDefsKey(NODE_DEFS_WANTED) {
+		rv := &NodeDefs{NodeDefs: make(map[string]*NodeDef)}
+		tmp := &NodeDefs{NodeDefs: make(map[string]*NodeDef)}
+		m := c.cfgMem.GetKeyWithPrefix(key)
+		for _, v := range m {
+			json.Unmarshal(v, tmp)
+			for k1, v1 := range tmp.NodeDefs {
+				log.Printf("combining key %v", k1)
+				rv.NodeDefs[k1] = v1
+			}
+			rv.UUID = tmp.UUID
+			rv.ImplVersion = tmp.ImplVersion
+		}
+		data, _ := json.Marshal(rv)
+		return data, 0, nil
+	}
 	return c.cfgMem.Get(key, cas)
 }
 
-func (c *CfgMetaKv) Set(key string, val []byte, cas uint64) (
+func (c *CfgMetaKv) SetKey(key string, val []byte) (
 	uint64, error) {
-	c.m.Lock()
-	defer c.m.Unlock()
-	rev, err := c.cfgMem.GetRev(key, cas)
+	var cas uint64
+	rev, err := c.cfgMem.GetRev(key, 0)
 	if err != nil {
 		return 0, err
 	}
@@ -82,6 +102,37 @@ func (c *CfgMetaKv) Set(key string, val []byte, cas uint64) (
 	return cas, err
 }
 
+func (c *CfgMetaKv) Set(key string, val []byte, cas uint64) (
+	uint64, error) {
+	log.Printf("setting key %v", key)
+	c.m.Lock()
+	defer c.m.Unlock()
+	var err error
+	if key == CfgNodeDefsKey(NODE_DEFS_WANTED) {
+		// split the keys
+		nd := &NodeDefs{}
+		err = json.Unmarshal(val, nd)
+		if err != nil {
+			return 0, err
+		}
+		for k, v := range nd.NodeDefs {
+			n := &NodeDefs{
+				UUID:        nd.UUID,
+				NodeDefs:    make(map[string]*NodeDef),
+				ImplVersion: nd.ImplVersion,
+			}
+			n.NodeDefs[k] = v
+			k = key + "_" + k
+			val, _ = json.Marshal(n)
+			log.Printf("splitted key %v", k)
+			cas, err = c.SetKey(k, val)
+		}
+	} else {
+		cas, err = c.SetKey(key, val)
+	}
+	return cas, err
+}
+
 func (c *CfgMetaKv) Del(key string, cas uint64) error {
 	c.m.Lock()
 	defer c.m.Unlock()
@@ -89,13 +140,26 @@ func (c *CfgMetaKv) Del(key string, cas uint64) error {
 }
 
 func (c *CfgMetaKv) delUnlocked(key string, cas uint64) error {
-	rev, err := c.cfgMem.GetRev(key, cas)
-	if err != nil {
-		return err
+	keys := []string{}
+	var err error
+	if strings.HasPrefix(key, CfgNodeDefsKey(NODE_DEFS_WANTED)) {
+		m := c.cfgMem.GetKeyWithPrefix(CfgNodeDefsKey(NODE_DEFS_WANTED))
+		for k, _ := range m {
+			keys = append(keys, k)
+		}
+	} else {
+		keys = append(keys, key)
 	}
-	err = metakv.Delete(c.makeKey(key), rev)
-	if err == nil {
-		return c.cfgMem.Del(key, 0)
+	// is this fine ? I dont think so.
+	for _, key := range keys {
+		rev, err := c.cfgMem.GetRev(key, cas)
+		if err != nil {
+			return err
+		}
+		err = metakv.Delete(c.makeKey(key), rev)
+		if err != nil {
+			return c.cfgMem.Del(key, 0)
+		}
 	}
 	return err
 }
