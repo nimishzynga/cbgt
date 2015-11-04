@@ -16,6 +16,7 @@ import (
 	log "github.com/couchbase/clog"
 	"math"
 	"sync"
+    "strings"
 )
 
 const (
@@ -24,10 +25,12 @@ const (
 )
 
 type CfgMetaKv struct {
+    uuid     string
 	m        sync.Mutex
 	path     string
 	cancelCh chan struct{}
 	rev      interface{}
+    nodeDefKeys map[string]int
 	cfgMem   *CfgMem
 }
 
@@ -38,6 +41,7 @@ func NewCfgMetaKv() (*CfgMetaKv, error) {
 		path:     BASE_CFG_PATH,
 		cancelCh: make(chan struct{}),
 		cfgMem:   NewCfgMem(),
+        uuid:     NewUUID(),
 	}
 	go func() {
 		for {
@@ -57,28 +61,70 @@ func (c *CfgMetaKv) Get(key string, cas uint64) (
 	[]byte, uint64, error) {
 	c.m.Lock()
 	defer c.m.Unlock()
+    if key == CfgNodeDefsKey(NODE_DEFS_WANTED) {
+        rv := &NodeDefs{NodeDefs:make(map[string]*NodeDef}
+        tmp := &NodeDefs{NodeDefs:make(map[string]*NodeDef}
+        m := c.cfgMem.GetKeyWithPrefix(key)
+        for k,v := range m {
+            json.Unmarshal(v, tmp)
+            for k1,v1 := range tmp.NodeDefs {
+                rv.NodeDefs[k1] = v1
+            }
+            rv.UUID = tmp.UUID
+            rv.ImplVersion = tmp.ImplVersion
+        }
+        data,_ := json.Marshal(rv)
+        return data, 0, nil
+    }
 	return c.cfgMem.Get(key, cas)
+}
+
+func (c *CfgMetaKv) SetKey(key string, val []byte) (
+    uint64, error) {
+    rev, err := c.cfgMem.GetRev(key, 0)
+        if err != nil {
+            return 0, err
+        }
+    if rev == nil {
+        err = metakv.Add(c.makeKey(key), val)
+    } else {
+        err = metakv.Set(c.makeKey(key), val, rev)
+    }
+    if err == nil {
+        cas, err = c.cfgMem.Set(key, val, CAS_FORCE)
+            if err != nil {
+                return 0, err
+            }
+    }
 }
 
 func (c *CfgMetaKv) Set(key string, val []byte, cas uint64) (
 	uint64, error) {
 	c.m.Lock()
 	defer c.m.Unlock()
-	rev, err := c.cfgMem.GetRev(key, cas)
-	if err != nil {
-		return 0, err
-	}
-	if rev == nil {
-		err = metakv.Add(c.makeKey(key), val)
-	} else {
-		err = metakv.Set(c.makeKey(key), val, rev)
-	}
-	if err == nil {
-		cas, err = c.cfgMem.Set(key, val, CAS_FORCE)
-		if err != nil {
-			return 0, err
-		}
-	}
+    var cas uint64
+    var err error
+    if key == CfgNodeDefsKey(NODE_DEFS_WANTED) {
+        // split the keys
+        nd := &NodeDefs{}
+        err = json.Unmarshal(val, nd)
+        if err != nil {
+            return 0, err
+        }
+        k,v := range nd.NodeDefs {
+            n := &NodeDefs{
+                UUID : nd.UUID,
+                NodeDefs:make(map[string]*NodeDef),
+                ImplVersion : nd.ImplVersion,
+            }
+            n.NodeDefs[k] = v
+            k = key + "_" + k
+            val,_ = json.Marshal(n)
+            cas, err = c.SetKey(k, val)
+        }
+    } else {
+       cas,err = c.SetKey(key, val)
+    }
 	return cas, err
 }
 
@@ -89,15 +135,27 @@ func (c *CfgMetaKv) Del(key string, cas uint64) error {
 }
 
 func (c *CfgMetaKv) delUnlocked(key string, cas uint64) error {
-	rev, err := c.cfgMem.GetRev(key, cas)
-	if err != nil {
-		return err
-	}
-	err = metakv.Delete(c.makeKey(key), rev)
-	if err == nil {
-		return c.cfgMem.Del(key, 0)
-	}
-	return err
+    keys := []string{}
+    if strings.HasPrefix(key, CfgNodeDefsKey(NODE_DEFS_WANTED)) {
+        m := c.cfgMem.GetKeyWithPrefix(CfgNodeDefsKey(NODE_DEFS_WANTED))
+        for k,_ := range m {
+            keys = append(keys, k)
+        }
+    } else {
+        keys = append(keys, key)
+    }
+    // is this fine ? I dont think so.
+    for _,key := range keys {
+        rev, err := c.cfgMem.GetRev(key, cas)
+            if err != nil {
+                return err
+            }
+        err = metakv.Delete(c.makeKey(key), rev)
+            if err != nil {
+                return c.cfgMem.Del(key, 0)
+            }
+    }
+    return err
 }
 
 func (c *CfgMetaKv) Load() error {
