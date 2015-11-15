@@ -15,15 +15,24 @@ import (
 	"encoding/json"
 	"github.com/couchbase/cbauth/metakv"
 	log "github.com/couchbase/clog"
+	"hash/crc32"
 	"math"
+	"sort"
 	"strings"
 	"sync"
 )
 
 const (
-	BASE_CFG_PATH = "/cbgt/cfg/"
-	CAS_FORCE     = math.MaxUint64
+	BASE_CFG_PATH            = "/cbgt/cfg/"
+	CFG_NODEDEFS_WANTED_PATH = "/cbgt/nodedefs/wanted"
+	CFG_NODEDEFS_KNOWN_PATH  = "/cbgt/nodedefs/known"
+	CAS_FORCE                = math.MaxUint64
 )
+
+var splitKeys map[string]string = map[string]string{
+	CfgNodeDefsKey(NODE_DEFS_WANTED): CFG_NODEDEFS_WANTED_PATH,
+	CfgNodeDefsKey(NODE_DEFS_KNOWN):  CFG_NODEDEFS_KNOWN_PATH,
+}
 
 type CfgMetaKv struct {
 	uuid        string
@@ -62,26 +71,34 @@ func (c *CfgMetaKv) Get(key string, cas uint64) (
 	[]byte, uint64, error) {
 	c.m.Lock()
 	defer c.m.Unlock()
-	if key == CfgNodeDefsKey(NODE_DEFS_WANTED) {
+	if splitRequired(key) {
 		rv := &NodeDefs{NodeDefs: make(map[string]*NodeDef)}
 		tmp := &NodeDefs{NodeDefs: make(map[string]*NodeDef)}
-		m := c.cfgMem.GetKeyWithPrefix(key)
+		m, err := metakv.listAllChildren(splitKeys[key])
+		if err {
+			return nil, 0, err
+		}
+		uuids := []string{}
 		for _, v := range m {
-			json.Unmarshal(v, tmp)
+			err = json.Unmarshal(v.Value, tmp)
+			if err != nil {
+				return nil, 0, err
+			}
 			for k1, v1 := range tmp.NodeDefs {
 				log.Printf("combining key %v", k1)
 				rv.NodeDefs[k1] = v1
 			}
-			rv.UUID = tmp.UUID
+			uuids = append(uuids, tmp.UUID)
 			rv.ImplVersion = tmp.ImplVersion
 		}
+		rv.UUID = getCksum(uuids)
 		data, _ := json.Marshal(rv)
 		return data, 0, nil
 	}
 	return c.cfgMem.Get(key, cas)
 }
 
-func (c *CfgMetaKv) SetKey(key string, val []byte) (
+func (c *CfgMetaKv) SetKey(key string, val []byte, cache bool) (
 	uint64, error) {
 	var cas uint64
 	rev, err := c.cfgMem.GetRev(key, 0)
@@ -93,7 +110,7 @@ func (c *CfgMetaKv) SetKey(key string, val []byte) (
 	} else {
 		err = metakv.Set(c.makeKey(key), val, rev)
 	}
-	if err == nil {
+	if err == nil && cache {
 		cas, err = c.cfgMem.Set(key, val, CAS_FORCE)
 		if err != nil {
 			return 0, err
@@ -108,7 +125,7 @@ func (c *CfgMetaKv) Set(key string, val []byte, cas uint64) (
 	c.m.Lock()
 	defer c.m.Unlock()
 	var err error
-	if key == CfgNodeDefsKey(NODE_DEFS_WANTED) {
+	if splitRequired(key) {
 		// split the keys
 		nd := &NodeDefs{}
 		err = json.Unmarshal(val, nd)
@@ -125,10 +142,10 @@ func (c *CfgMetaKv) Set(key string, val []byte, cas uint64) (
 			k = key + "_" + k
 			val, _ = json.Marshal(n)
 			log.Printf("splitted key %v", k)
-			cas, err = c.SetKey(k, val)
+			cas, err = c.SetKey(k, val, false)
 		}
 	} else {
-		cas, err = c.SetKey(key, val)
+		cas, err = c.SetKey(key, val, true)
 	}
 	return cas, err
 }
@@ -142,24 +159,17 @@ func (c *CfgMetaKv) Del(key string, cas uint64) error {
 func (c *CfgMetaKv) delUnlocked(key string, cas uint64) error {
 	keys := []string{}
 	var err error
-	if strings.HasPrefix(key, CfgNodeDefsKey(NODE_DEFS_WANTED)) {
-		m := c.cfgMem.GetKeyWithPrefix(CfgNodeDefsKey(NODE_DEFS_WANTED))
-		for k, _ := range m {
-			keys = append(keys, k)
-		}
-	} else {
-		keys = append(keys, key)
+	if splitRequired(key) {
+		return metakv.RecursiveDelete(splitKeys[key])
 	}
 	// is this fine ? I dont think so.
-	for _, key := range keys {
-		rev, err := c.cfgMem.GetRev(key, cas)
-		if err != nil {
-			return err
-		}
-		err = metakv.Delete(c.makeKey(key), rev)
-		if err != nil {
-			return c.cfgMem.Del(key, 0)
-		}
+	rev, err := c.cfgMem.GetRev(key, cas)
+	if err != nil {
+		return err
+	}
+	err = metakv.Delete(c.makeKey(key), rev)
+	if err != nil {
+		return c.cfgMem.Del(key, 0)
 	}
 	return err
 }
@@ -184,6 +194,21 @@ func (c *CfgMetaKv) metaKVCallback(path string, value []byte, rev interface{}) e
 	return err
 }
 
+func getCksum(uuids []string) string {
+	sort.Strings(uuids)
+	d, _ = json.Marshal(uuids)
+	return crc32.ChecksumIEEE(d)
+}
+
+func splitRequired(key string) bool {
+	for k, _ := range splitKeys {
+		if strings.HasPrefix(key, k) {
+			return true
+		}
+	}
+	return false
+}
+
 func (c *CfgMetaKv) Subscribe(key string, ch chan CfgEvent) error {
 	c.m.Lock()
 	defer c.m.Unlock()
@@ -203,7 +228,12 @@ func (c *CfgMetaKv) DelConf() {
 	metakv.RecursiveDelete(c.path)
 }
 
-func (c *CfgMetaKv) makeKey(k string) string {
+func (c *CfgMetaKv) makeKey(key string) string {
+	for k, v := range splitKeys {
+		if strings.HasPrefix(key, k) {
+			return key + v
+		}
+	}
 	return c.path + k
 }
 
