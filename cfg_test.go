@@ -438,6 +438,14 @@ func TestCfgCB(t *testing.T) {
 }
 
 // ------------------------------------------------
+func TestCfgMetaKv(t *testing.T) {
+	emptyDir, _ := ioutil.TempDir("./tmp", "test")
+	defer os.RemoveAll(emptyDir)
+
+	cfg := NewCfgMetaKv(emptyDir + string(os.PathSeparator) + "test.cfg")
+	testCfg(t, cfg)
+}
+
 
 // Disabled as metakv just spams with endless log messages of...
 //
@@ -483,3 +491,5 @@ func disabled_TestCfgMetaKvIllConfigured(t *testing.T) {
 		t.Errorf("expected err on del because metakv not properly setup")
 	}
 }
+
+
