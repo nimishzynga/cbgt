@@ -20,12 +20,13 @@ import (
 	"sort"
 	"strings"
 	"sync"
+	"strconv"
 )
 
 const (
 	BASE_CFG_PATH            = "/cbgt/cfg/"
-	CFG_NODEDEFS_WANTED_PATH = "/cbgt/nodedefs/wanted"
-	CFG_NODEDEFS_KNOWN_PATH  = "/cbgt/nodedefs/known"
+	CFG_NODEDEFS_WANTED_PATH = "/cbgt/nodedefs/wanted/"
+	CFG_NODEDEFS_KNOWN_PATH  = "/cbgt/nodedefs/known/"
 	CAS_FORCE                = math.MaxUint64
 )
 
@@ -73,9 +74,9 @@ func (c *CfgMetaKv) Get(key string, cas uint64) (
 	defer c.m.Unlock()
 	if splitRequired(key) {
 		rv := &NodeDefs{NodeDefs: make(map[string]*NodeDef)}
-		tmp := &NodeDefs{NodeDefs: make(map[string]*NodeDef)}
-		m, err := metakv.listAllChildren(splitKeys[key])
-		if err {
+		tmp := &NodeDefs{}
+		m, err := metakv.ListAllChildren(splitKeys[key])
+		if err != nil {
 			return nil, 0, err
 		}
 		uuids := []string{}
@@ -85,7 +86,6 @@ func (c *CfgMetaKv) Get(key string, cas uint64) (
 				return nil, 0, err
 			}
 			for k1, v1 := range tmp.NodeDefs {
-				log.Printf("combining key %v", k1)
 				rv.NodeDefs[k1] = v1
 			}
 			uuids = append(uuids, tmp.UUID)
@@ -157,7 +157,6 @@ func (c *CfgMetaKv) Del(key string, cas uint64) error {
 }
 
 func (c *CfgMetaKv) delUnlocked(key string, cas uint64) error {
-	keys := []string{}
 	var err error
 	if splitRequired(key) {
 		return metakv.RecursiveDelete(splitKeys[key])
@@ -187,6 +186,7 @@ func (c *CfgMetaKv) metaKVCallback(path string, value []byte, rev interface{}) e
 		// key got deleted
 		return c.delUnlocked(key, 0)
 	}
+    log.Printf("callback got key %v", key)
 	cas, err := c.cfgMem.Set(key, value, CAS_FORCE)
 	if err == nil {
 		c.cfgMem.SetRev(key, cas, rev)
@@ -196,8 +196,8 @@ func (c *CfgMetaKv) metaKVCallback(path string, value []byte, rev interface{}) e
 
 func getCksum(uuids []string) string {
 	sort.Strings(uuids)
-	d, _ = json.Marshal(uuids)
-	return crc32.ChecksumIEEE(d)
+	d, _ := json.Marshal(uuids)
+	return strconv.Itoa(int(crc32.ChecksumIEEE(d)))
 }
 
 func splitRequired(key string) bool {
@@ -231,12 +231,27 @@ func (c *CfgMetaKv) DelConf() {
 func (c *CfgMetaKv) makeKey(key string) string {
 	for k, v := range splitKeys {
 		if strings.HasPrefix(key, k) {
-			return key + v
+			return v + key
 		}
 	}
-	return c.path + k
+	return c.path + key
 }
 
 func (c *CfgMetaKv) getMetaKey(k string) string {
 	return k[len(c.path):]
+}
+
+// for testing
+func (c *CfgMetaKv) getAllKeys(k string) ([]string, error) {
+    g := []string{}
+    if splitRequired(k) {
+		m, err := metakv.ListAllChildren(splitKeys[k])
+		if err != nil {
+			return nil, err
+		}
+        for _,v := range m {
+            g = append(g, v.Path)
+        }
+    }
+    return g,nil
 }
